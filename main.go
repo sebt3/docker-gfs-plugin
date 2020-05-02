@@ -11,10 +11,10 @@ import (
 )
 
 const (
-	vgConfigPath         = "/etc/docker/docker-lvm-plugin"
-	lvmHome              = "/var/lib/docker-lvm-plugin"
-	lvmVolumesConfigPath = "/var/lib/docker-lvm-plugin/lvmVolumesConfig.json"
-	lvmCountConfigPath   = "/var/lib/docker-lvm-plugin/lvmCountConfig.json"
+	vgConfigPath         = "/etc/docker/docker-gfs-plugin"
+	gfsHome              = "/var/lib/docker-gfs-plugin"
+	gfsVolumesConfigPath = "/var/lib/docker-gfs-plugin/gfsVolumesConfig.json"
+	gfsCountConfigPath   = "/var/lib/docker-gfs-plugin/gfsCountConfig.json"
 )
 
 var (
@@ -32,7 +32,7 @@ func main() {
 	flag.Parse()
 
 	if *flVersion {
-		fmt.Fprint(os.Stdout, "docker lvm plugin version: 1.0.0\n")
+		fmt.Fprint(os.Stdout, "docker gfs plugin version: 1.0.0\n")
 		return
 	}
 
@@ -40,34 +40,34 @@ func main() {
 		logrus.SetLevel(logrus.DebugLevel)
 	}
 
-	if _, err := exec.LookPath("mkfs.xfs"); err != nil {
-		logrus.Fatal("mkfs.xfs is not available, please install xfsprogs to continue")
+	if _, err := exec.LookPath("mkfs.gfs2"); err != nil {
+		logrus.Fatal("mkfs.gfs2 is not available, please install gfs2-utils to continue")
 	}
 
-	if _, err := os.Stat(lvmHome); err != nil {
+	if _, err := os.Stat(gfsHome); err != nil {
 		if !os.IsNotExist(err) {
 			logrus.Fatal(err)
 		}
-		logrus.Debugf("Created home dir at %s", lvmHome)
-		if err := os.MkdirAll(lvmHome, 0700); err != nil {
+		logrus.Debugf("Created home dir at %s", gfsHome)
+		if err := os.MkdirAll(gfsHome, 0700); err != nil {
 			logrus.Fatal(err)
 		}
 	}
 
-	lvm, err := newDriver(lvmHome, vgConfigPath)
+	gfs, err := newDriver(gfsHome, vgConfigPath)
 	if err != nil {
-		logrus.Fatalf("Error initializing lvmDriver %v", err)
+		logrus.Fatalf("Error initializing gfsDriver %v", err)
 	}
 
 	// Call loadFromDisk only if config file exists.
-	if _, err := os.Stat(lvmVolumesConfigPath); err == nil {
-		if err := loadFromDisk(lvm); err != nil {
+	if _, err := os.Stat(gfsVolumesConfigPath); err == nil {
+		if err := loadFromDisk(gfs); err != nil {
 			logrus.Fatal(err)
 		}
 	}
 
-	h := volume.NewHandler(lvm)
-	if err := h.ServeUnix("lvm", 0); err != nil {
+	h := volume.NewHandler(gfs)
+	if err := h.ServeUnix("gfs", 0); err != nil {
 		logrus.Fatal(err)
 	}
 }

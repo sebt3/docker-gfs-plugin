@@ -4,4 +4,8 @@
 # OR create a new volume group using `vgcreate` command. 
 # e.g. vgcreate volume_group_one /dev/hda where /dev/hda is your partition or
 # whole disk on which physical volumes were created.
-VOLUME_GROUP=
+VOLUME_GROUP=docker
+# Name of the cluster for lvmlockd
+CLUSTER_NAME=mycluster
+# Number of time the volume can be mounted at the same time
+NODE_COUNT=3

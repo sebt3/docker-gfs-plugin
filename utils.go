@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"encoding/json"
 	"fmt"
@@ -11,13 +10,10 @@ import (
 	"path"
 	"strings"
 	"time"
+	"strconv"
 
 	icmd "github.com/docker/docker/pkg/system"
 )
-
-var allowedConfKeys = map[string]bool{
-	"VOLUME_GROUP": true,
-}
 
 func removeLogicalVolume(name, vgName string) ([]byte, error) {
 	cmd := exec.Command("lvremove", "--force", fmt.Sprintf("%s/%s", vgName, name))
@@ -27,36 +23,29 @@ func removeLogicalVolume(name, vgName string) ([]byte, error) {
 	return nil, nil
 }
 
-func getVolumegroupName(vgConfig string) (string, error) {
-	vgName := ""
-	inFile, err := os.Open(vgConfig)
+func getClusterName() (string, error) {
+	vol := os.Getenv("CLUSTER_NAME")
+	if len(vol) == 0 {
+		return "mycluster", nil
+	}
+	return strings.TrimSpace(vol), nil
+}
+func getNodeCount() (string, error) {
+	cnt := os.Getenv("NODE_COUNT")
+	if len(cnt) == 0 {
+		return "3", nil
+	}
+	i, err := strconv.ParseInt(strings.TrimSpace(cnt), 10, 64)
 	if err != nil {
-		return "", err
+		return "3", err
 	}
-	defer inFile.Close()
-	scanner := bufio.NewScanner(inFile)
-	scanner.Split(bufio.ScanLines)
-
-	for scanner.Scan() {
-		str := scanner.Text()
-		if strings.HasPrefix(str, "#") {
-			continue
-		}
-		vgSlice := strings.SplitN(str, "=", 2)
-		if !allowedConfKeys[vgSlice[0]] || len(vgSlice) == 1 {
-			continue
-		}
-		vgName = vgSlice[1]
-		break
+	return fmt.Sprintf("%d",i), nil
+}
+func getVolumegroupName() (string, error) {
+	vgName := os.Getenv("VOLUME_GROUP")
+	if len(vgName) == 0 {
+		return "docker", nil
 	}
-	if err := scanner.Err(); err != nil {
-		return "", err
-	}
-
-	if vgName == "" {
-		return "", fmt.Errorf("Volume group name must be provided for volume creation. Please update the config file %s with volume group name.", vgConfig)
-	}
-
 	return strings.TrimSpace(vgName), nil
 }
 
@@ -66,7 +55,7 @@ func getMountpoint(home, name string) string {
 
 func saveToDisk(volumes map[string]*vol, count map[string]int) error {
 	// Save volume store metadata.
-	fhVolumes, err := os.Create(lvmVolumesConfigPath)
+	fhVolumes, err := os.Create(gfsVolumesConfigPath)
 	if err != nil {
 		return err
 	}
@@ -77,7 +66,7 @@ func saveToDisk(volumes map[string]*vol, count map[string]int) error {
 	}
 
 	// Save count store metadata.
-	fhCount, err := os.Create(lvmCountConfigPath)
+	fhCount, err := os.Create(gfsCountConfigPath)
 	if err != nil {
 		return err
 	}
@@ -86,9 +75,9 @@ func saveToDisk(volumes map[string]*vol, count map[string]int) error {
 	return json.NewEncoder(fhCount).Encode(&count)
 }
 
-func loadFromDisk(l *lvmDriver) error {
+func loadFromDisk(l *gfsDriver) error {
 	// Load volume store metadata
-	jsonVolumes, err := os.Open(lvmVolumesConfigPath)
+	jsonVolumes, err := os.Open(gfsVolumesConfigPath)
 	if err != nil {
 		return err
 	}
@@ -99,7 +88,7 @@ func loadFromDisk(l *lvmDriver) error {
 	}
 
 	// Load count store metadata
-	jsonCount, err := os.Open(lvmCountConfigPath)
+	jsonCount, err := os.Open(gfsCountConfigPath)
 	if err != nil {
 		return err
 	}

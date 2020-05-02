@@ -10,10 +10,11 @@ import (
 
 	"github.com/docker/docker/pkg/mount"
 	"github.com/docker/go-plugins-helpers/volume"
+	"github.com/sirupsen/logrus"
 	units "github.com/docker/go-units"
 )
 
-type lvmDriver struct {
+type gfsDriver struct {
 	home     string
 	vgConfig string
 	volumes  map[string]*vol
@@ -31,13 +32,13 @@ type vol struct {
 	KeyFile    string `json:"keyfile"`
 }
 
-func newDriver(home, vgConfig string) (*lvmDriver, error) {
-	logger, err := syslog.New(syslog.LOG_ERR, "docker-lvm-plugin")
+func newDriver(home, vgConfig string) (*gfsDriver, error) {
+	logger, err := syslog.New(syslog.LOG_ERR, "docker-gfs-plugin")
 	if err != nil {
 		return nil, err
 	}
 
-	return &lvmDriver{
+	return &gfsDriver{
 		home:     home,
 		vgConfig: vgConfig,
 		volumes:  make(map[string]*vol),
@@ -46,20 +47,39 @@ func newDriver(home, vgConfig string) (*lvmDriver, error) {
 	}, nil
 }
 
-func (l *lvmDriver) Create(req *volume.CreateRequest) error {
+func (l *gfsDriver) Create(req *volume.CreateRequest) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
+	if _, err := os.Stat(gfsVolumesConfigPath); err == nil {
+		if err := loadFromDisk(l); err != nil {
+			logrus.Fatal(err)
+		}
+	}
 	if _, exists := l.volumes[req.Name]; exists {
 		return nil
 	}
 
-	vgName, err := getVolumegroupName(l.vgConfig)
+	vgName, err := getVolumegroupName()
 	if err != nil {
 		return err
 	}
 	if vgNameOpt, ok := req.Options["vg"]; ok && vgNameOpt != "" {
 		vgName = vgNameOpt
+	}
+	nCount, err := getNodeCount()
+	if err != nil {
+		return err
+	}
+	if nCountOpt, ok := req.Options["node_count"]; ok && nCountOpt != "" {
+		nCount = nCountOpt
+	}
+	cName, err := getClusterName()
+	if err != nil {
+		return err
+	}
+	if cNameOpt, ok := req.Options["cluster_name"]; ok && cNameOpt != "" {
+		cName = cNameOpt
 	}
 
 	keyFile, ok := req.Options["keyfile"]
@@ -73,19 +93,7 @@ func (l *lvmDriver) Create(req *volume.CreateRequest) error {
 		}
 	}
 
-	cmdArgs := []string{"-y", "-n", req.Name, "--setactivationskip", "n"}
-	snap, ok := req.Options["snapshot"]
-	isSnapshot := ok && snap != ""
-	isThinSnap := false
-	if isSnapshot {
-		if hasKeyFile {
-			return fmt.Errorf("Please don't specify --opt keyfile= for snapshots")
-		}
-		if isThinSnap, _, err = isThinlyProvisioned(vgName, snap); err != nil {
-			l.logger.Err(fmt.Sprintf("Create: lvdisplayGrep error: %s", err))
-			return fmt.Errorf("Error creating volume")
-		}
-	}
+	cmdArgs := []string{"-asy", "--name", req.Name}
 	s, ok := req.Options["size"]
 	hasSize := ok && s != ""
 
@@ -99,28 +107,12 @@ func (l *lvmDriver) Create(req *volume.CreateRequest) error {
 		}
 	}
 
-	if !hasSize && !isThinSnap {
+	if !hasSize {
 		return fmt.Errorf("Please specify a size with --opt size=")
 	}
 
-	if hasSize && isThinSnap {
-		return fmt.Errorf("Please don't specify --opt size= for thin snapshots")
-	}
-
-	if isSnapshot {
-		cmdArgs = append(cmdArgs, "--snapshot")
-		if hasSize {
-			cmdArgs = append(cmdArgs, "--size", s)
-		}
-		cmdArgs = append(cmdArgs, vgName+"/"+snap)
-	} else if thin, ok := req.Options["thinpool"]; ok && thin != "" {
-		cmdArgs = append(cmdArgs, "--virtualsize", s)
-		cmdArgs = append(cmdArgs, "--thin")
-		cmdArgs = append(cmdArgs, vgName+"/"+thin)
-	} else {
-		cmdArgs = append(cmdArgs, "--size", s)
-		cmdArgs = append(cmdArgs, vgName)
-	}
+	cmdArgs = append(cmdArgs, "--size", s)
+	cmdArgs = append(cmdArgs, vgName)
 	cmd := exec.Command("lvcreate", cmdArgs...)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		l.logger.Err(fmt.Sprintf("Create: lvcreate error: %s output %s", err, string(out)))
@@ -133,43 +125,41 @@ func (l *lvmDriver) Create(req *volume.CreateRequest) error {
 		}
 	}()
 
-	if !isSnapshot {
-		device := logicalDevice(vgName, req.Name)
+	device := logicalDevice(vgName, req.Name)
 
-		if hasKeyFile {
-			cmd = exec.Command("cryptsetup", "-q", "-d", keyFile, "luksFormat", device)
-			if out, err := cmd.CombinedOutput(); err != nil {
-				l.logger.Err(fmt.Sprintf("Create: cryptsetup error: %s output %s", err, string(out)))
-				return fmt.Errorf("Error encrypting volume")
-			}
-
-			if out, err := luksOpen(vgName, req.Name, keyFile); err != nil {
-				l.logger.Err(fmt.Sprintf("Create: cryptsetup error: %s output %s", err, string(out)))
-				return fmt.Errorf("Error opening encrypted volume")
-			}
-
-			defer func() {
-				if err != nil {
-					if out, err := luksClose(req.Name); err != nil {
-						l.logger.Err(fmt.Sprintf("Create: cryptsetup error: %s output %s", err, string(out)))
-					}
-				}
-			}()
-
-			device = luksDevice(req.Name)
-		}
-
-		cmd = exec.Command("mkfs.xfs", device)
+	if hasKeyFile {
+		cmd = exec.Command("cryptsetup", "-q", "-d", keyFile, "luksFormat", device)
 		if out, err := cmd.CombinedOutput(); err != nil {
-			l.logger.Err(fmt.Sprintf("Create: mkfs.xfs error: %s output %s", err, string(out)))
-			return fmt.Errorf("Error partitioning volume")
+			l.logger.Err(fmt.Sprintf("Create: cryptsetup error: %s output %s", err, string(out)))
+			return fmt.Errorf("Error encrypting volume")
 		}
 
-		if hasKeyFile {
-			if out, err := luksClose(req.Name); err != nil {
-				l.logger.Err(fmt.Sprintf("Create: cryptsetup error: %s output %s", err, string(out)))
-				return fmt.Errorf("Error closing encrypted volume")
+		if out, err := luksOpen(vgName, req.Name, keyFile); err != nil {
+			l.logger.Err(fmt.Sprintf("Create: cryptsetup error: %s output %s", err, string(out)))
+			return fmt.Errorf("Error opening encrypted volume")
+		}
+
+		defer func() {
+			if err != nil {
+				if out, err := luksClose(req.Name); err != nil {
+					l.logger.Err(fmt.Sprintf("Create: cryptsetup error: %s output %s", err, string(out)))
+				}
 			}
+		}()
+
+		device = luksDevice(req.Name)
+	}
+
+	cmd = exec.Command("mkfs.gfs2", "-O", "-j", nCount, "-t", cName+":"+req.Name, device)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		l.logger.Err(fmt.Sprintf("Create: mkfs.gfs2 error: %s output %s", err, string(out)))
+		return fmt.Errorf("Error partitioning volume")
+	}
+
+	if hasKeyFile {
+		if out, err := luksClose(req.Name); err != nil {
+			l.logger.Err(fmt.Sprintf("Create: cryptsetup error: %s output %s", err, string(out)))
+			return fmt.Errorf("Error closing encrypted volume")
 		}
 	}
 
@@ -185,12 +175,7 @@ func (l *lvmDriver) Create(req *volume.CreateRequest) error {
 	}()
 
 	v := &vol{Name: req.Name, VgName: vgName, MountPoint: mp}
-	if isSnapshot {
-		source := l.volumes[snap]
-		v.Type = "Snapshot"
-		v.Source = snap
-		v.KeyFile = source.KeyFile
-	} else if hasKeyFile {
+	if hasKeyFile {
 		v.KeyFile = keyFile
 	}
 	l.volumes[v.Name] = v
@@ -202,9 +187,17 @@ func (l *lvmDriver) Create(req *volume.CreateRequest) error {
 	return nil
 }
 
-func (l *lvmDriver) List() (*volume.ListResponse, error) {
+func (l *gfsDriver) List() (*volume.ListResponse, error) {
+	l.logger.Info("List, accessing the lock")
 	l.mu.RLock()
 	defer l.mu.RUnlock()
+	l.logger.Info("List, reading the datafiles")
+	if _, err := os.Stat(gfsVolumesConfigPath); err == nil {
+		if err := loadFromDisk(l); err != nil {
+			logrus.Fatal(err)
+		}
+	}
+	l.logger.Info("List, Create the reply array")
 	var ls []*volume.Volume
 	for _, vol := range l.volumes {
 		v := &volume.Volume{
@@ -214,16 +207,22 @@ func (l *lvmDriver) List() (*volume.ListResponse, error) {
 		}
 		ls = append(ls, v)
 	}
+	l.logger.Info("List, done")
 	return &volume.ListResponse{Volumes: ls}, nil
 }
 
-func (l *lvmDriver) Get(req *volume.GetRequest) (*volume.GetResponse, error) {
+func (l *gfsDriver) Get(req *volume.GetRequest) (*volume.GetResponse, error) {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 
-	vgName, err := getVolumegroupName(l.vgConfig)
+	vgName, err := getVolumegroupName()
 	if err != nil {
 		return nil, err
+	}
+	if _, err := os.Stat(gfsVolumesConfigPath); err == nil {
+		if err := loadFromDisk(l); err != nil {
+			logrus.Fatal(err)
+		}
 	}
 
 	v, exists := l.volumes[req.Name]
@@ -249,11 +248,17 @@ func (l *lvmDriver) Get(req *volume.GetRequest) (*volume.GetResponse, error) {
 	return &res, nil
 }
 
-func (l *lvmDriver) Remove(req *volume.RemoveRequest) error {
+func (l *gfsDriver) Remove(req *volume.RemoveRequest) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	vgName, err := getVolumegroupName(l.vgConfig)
+	if _, err := os.Stat(gfsVolumesConfigPath); err == nil {
+		if err := loadFromDisk(l); err != nil {
+			logrus.Fatal(err)
+		}
+	}
+
+	vgName, err := getVolumegroupName()
 	if err != nil {
 		return err
 	}
@@ -298,15 +303,20 @@ func (l *lvmDriver) Remove(req *volume.RemoveRequest) error {
 	return nil
 }
 
-func (l *lvmDriver) Path(req *volume.PathRequest) (*volume.PathResponse, error) {
+func (l *gfsDriver) Path(req *volume.PathRequest) (*volume.PathResponse, error) {
 	return &volume.PathResponse{Mountpoint: getMountpoint(l.home, req.Name)}, nil
 }
 
-func (l *lvmDriver) Mount(req *volume.MountRequest) (*volume.MountResponse, error) {
+func (l *gfsDriver) Mount(req *volume.MountRequest) (*volume.MountResponse, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	vgName, err := getVolumegroupName(l.vgConfig)
+	if _, err := os.Stat(gfsVolumesConfigPath); err == nil {
+		if err := loadFromDisk(l); err != nil {
+			logrus.Fatal(err)
+		}
+	}
+	vgName, err := getVolumegroupName()
 	if err != nil {
 		return &volume.MountResponse{}, err
 	}
@@ -317,6 +327,11 @@ func (l *lvmDriver) Mount(req *volume.MountRequest) (*volume.MountResponse, erro
 	if vol.VgName == "" {
 		vol.VgName = vgName
 	}
+	cmd := exec.Command("/usr/sbin/vgchange", "-asy", "docker")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		l.logger.Err(fmt.Sprintf("vgchange:  error: %s output %s", err, string(out)))
+	}
+
 
 	isSnap, keyFile := func() (bool, string) {
 		if v, ok := l.volumes[req.Name]; ok {
@@ -328,41 +343,39 @@ func (l *lvmDriver) Mount(req *volume.MountRequest) (*volume.MountResponse, erro
 		return false, ""
 	}()
 
-	if l.count[req.Name] == 0 {
-		device := logicalDevice(vol.VgName, req.Name)
+	device := logicalDevice(vol.VgName, req.Name)
 
-		if keyFile != "" {
-			if err := keyFileExists(keyFile); err != nil {
-				l.logger.Err(fmt.Sprintf("Mount: %s", err))
-				return &volume.MountResponse{}, err
-			}
-			if err := cryptsetupInstalled(); err != nil {
-				l.logger.Err(fmt.Sprintf("Mount: %s", err))
-				return &volume.MountResponse{}, err
-			}
-			if out, err := luksOpen(vol.VgName, req.Name, keyFile); err != nil {
-				l.logger.Err(fmt.Sprintf("Mount: cryptsetup error: %s output %s", err, string(out)))
-				return &volume.MountResponse{}, fmt.Errorf("Error opening encrypted volume")
-			}
-			defer func() {
-				if err != nil {
-					if out, err := luksClose(req.Name); err != nil {
-						l.logger.Err(fmt.Sprintf("Mount: cryptsetup error: %s output %s", err, string(out)))
-					}
+	if keyFile != "" {
+		if err := keyFileExists(keyFile); err != nil {
+			l.logger.Err(fmt.Sprintf("Mount: %s", err))
+			return &volume.MountResponse{}, err
+		}
+		if err := cryptsetupInstalled(); err != nil {
+			l.logger.Err(fmt.Sprintf("Mount: %s", err))
+			return &volume.MountResponse{}, err
+		}
+		if out, err := luksOpen(vol.VgName, req.Name, keyFile); err != nil {
+			l.logger.Err(fmt.Sprintf("Mount: cryptsetup error: %s output %s", err, string(out)))
+			return &volume.MountResponse{}, fmt.Errorf("Error opening encrypted volume")
+		}
+		defer func() {
+			if err != nil {
+				if out, err := luksClose(req.Name); err != nil {
+					l.logger.Err(fmt.Sprintf("Mount: cryptsetup error: %s output %s", err, string(out)))
 				}
-			}()
-			device = luksDevice(req.Name)
-		}
+			}
+		}()
+		device = luksDevice(req.Name)
+	}
 
-		mountArgs := []string{device, getMountpoint(l.home, req.Name)}
-		if isSnap {
-			mountArgs = append([]string{"-o", "nouuid"}, mountArgs...)
-		}
-		cmd := exec.Command("mount", mountArgs...)
-		if out, err := cmd.CombinedOutput(); err != nil {
-			l.logger.Err(fmt.Sprintf("Mount: mount error: %s output %s", err, string(out)))
-			return &volume.MountResponse{}, fmt.Errorf("Error mouting volume")
-		}
+	mountArgs := []string{device, getMountpoint(l.home, req.Name)}
+	if isSnap {
+		mountArgs = append([]string{"-o", "nouuid"}, mountArgs...)
+	}
+	cmd = exec.Command("mount", mountArgs...)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		l.logger.Err(fmt.Sprintf("Mount: mount error: %s output %s", err, string(out)))
+		return &volume.MountResponse{}, fmt.Errorf("Error mouting volume")
 	}
 	l.count[req.Name]++
 	if err := saveToDisk(l.volumes, l.count); err != nil {
@@ -371,9 +384,14 @@ func (l *lvmDriver) Mount(req *volume.MountRequest) (*volume.MountResponse, erro
 	return &volume.MountResponse{Mountpoint: getMountpoint(l.home, req.Name)}, nil
 }
 
-func (l *lvmDriver) Unmount(req *volume.UnmountRequest) error {
+func (l *gfsDriver) Unmount(req *volume.UnmountRequest) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if _, err := os.Stat(gfsVolumesConfigPath); err == nil {
+		if err := loadFromDisk(l); err != nil {
+			logrus.Fatal(err)
+		}
+	}
 	if l.count[req.Name] == 1 {
 		mp := getMountpoint(l.home, req.Name)
 		isVolMounted, err := mount.Mounted(mp)
@@ -406,9 +424,9 @@ func (l *lvmDriver) Unmount(req *volume.UnmountRequest) error {
 	return nil
 }
 
-func (l *lvmDriver) Capabilities() *volume.CapabilitiesResponse {
+func (l *gfsDriver) Capabilities() *volume.CapabilitiesResponse {
 	var res volume.CapabilitiesResponse
-	res.Capabilities = volume.Capability{Scope: "local"}
+	res.Capabilities = volume.Capability{Scope: "global"}
 	return &res
 }
 

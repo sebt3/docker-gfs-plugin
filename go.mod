@@ -1,4 +1,4 @@
-module github.com/docker-lvm-plugin
+module github.com/docker-gfs-plugin
 
 go 1.12
 

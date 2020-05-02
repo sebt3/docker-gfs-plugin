@@ -1,0 +1,13 @@
+[Unit]
+Description=Docker Volume Driver for gfs volumes
+Before=docker.service
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/docker/docker-gfs-plugin
+ExecStart=/usr/libexec/docker/docker-gfs-plugin
+
+[Install]
+WantedBy=multi-user.target
+
+
